@@ -55,6 +55,8 @@ python prepare_swim.py \
 
 脚本严格沿用 `ImageSets/train.txt`、`val.txt`、`test.txt` 的 6960/2320/2320 正样本划分，解析 XML 中的 `cx/cy/w/h/angle` 并生成四角点标签。Kaggle 上默认使用符号链接，不会把 11,600 张图片重复复制到 working；独立的 3,010 张 `Negative` 图片暂不混入第一版 benchmark。
 
+转换器默认保留 SWIM XML 中的原始旋转矩形，不裁剪落在图像外的角点。因此少量归一化坐标可能超出 `[0, 1]`，当前 Ultralytics 可能将超出容差的图片/标签标为 corrupt 并忽略；第一轮先用此设置检查训练流程。若之后需要裁剪对照，可在转换命令末尾添加 `--clip-boxes`。
+
 ## 最小实验
 
 先用完全相同的数据划分、seed、训练轮数和图像尺寸跑 baseline：

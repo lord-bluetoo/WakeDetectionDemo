@@ -21,6 +21,7 @@ SPLITS = ("train", "val", "test")
 class ConversionStats:
     images: int = 0
     boxes: int = 0
+    out_of_bounds_boxes: int = 0
     clipped_boxes: int = 0
     skipped_difficult: int = 0
     empty_labels: int = 0
@@ -49,7 +50,7 @@ def rotated_box_corners(cx: float, cy: float, width: float, height: float, angle
     ]
 
 
-def convert_annotation(xml_path: str | Path, *, clip_boxes: bool = True) -> tuple[list[list[float]], ConversionStats]:
+def convert_annotation(xml_path: str | Path, *, clip_boxes: bool = False) -> tuple[list[list[float]], ConversionStats]:
     """Convert one SWIM XML file into normalized four-corner OBB records."""
 
     xml_path = Path(xml_path)
@@ -86,12 +87,13 @@ def convert_annotation(xml_path: str | Path, *, clip_boxes: bool = True) -> tupl
             x < 0 or x > image_width or y < 0 or y > image_height for x, y in corners
         )
         if out_of_bounds:
-            stats.clipped_boxes += 1
+            stats.out_of_bounds_boxes += 1
             if clip_boxes:
                 corners = [
                     (min(max(x, 0.0), image_width), min(max(y, 0.0), image_height))
                     for x, y in corners
                 ]
+                stats.clipped_boxes += 1
 
         normalized = []
         for x, y in corners:
@@ -146,7 +148,7 @@ def convert_swim_dataset(
     output: str | Path,
     *,
     image_mode: str = "auto",
-    clip_boxes: bool = True,
+    clip_boxes: bool = False,
 ) -> dict[str, ConversionStats]:
     """Convert official SWIM train/val/test splits and write ``swim.yaml``."""
 
@@ -215,9 +217,9 @@ def parse_args() -> argparse.Namespace:
         help="auto uses symlinks on Kaggle and falls back to copying when unavailable",
     )
     parser.add_argument(
-        "--no-clip-boxes",
+        "--clip-boxes",
         action="store_true",
-        help="Keep out-of-image corners instead of clipping them into [0, 1]",
+        help="Clamp out-of-image corners into [0, 1]; the default preserves the original SWIM rectangles",
     )
     return parser.parse_args()
 
@@ -228,7 +230,7 @@ def main() -> None:
         args.source,
         args.output,
         image_mode=args.image_mode,
-        clip_boxes=not args.no_clip_boxes,
+        clip_boxes=args.clip_boxes,
     )
     print(f"Converted SWIM to: {Path(args.output).resolve()}")
     total = ConversionStats()
@@ -236,11 +238,16 @@ def main() -> None:
         total.add(stats)
         print(f"{split:>5}: {asdict(stats)}")
     print(f"total: {asdict(total)}")
-    if total.clipped_boxes:
-        print("WARNING: Some OBB corners crossed the image boundary and were clipped; inspect this count.")
+    if total.out_of_bounds_boxes:
+        if total.clipped_boxes:
+            print("WARNING: Some OBB corners crossed the image boundary and were clipped by request.")
+        else:
+            print(
+                "WARNING: Some OBB corners cross the image boundary and were kept unchanged; "
+                "Ultralytics may reject labels outside its coordinate tolerance."
+            )
     print(f"Dataset YAML: {Path(args.output).resolve() / 'swim.yaml'}")
 
 
 if __name__ == "__main__":
     main()
-

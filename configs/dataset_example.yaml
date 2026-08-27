@@ -1,0 +1,9 @@
+# Copy this file and replace the paths with your SWIM/OpenSARWake conversion.
+path: /absolute/path/to/SWIM_yolo_obb
+train: images/train
+val: images/val
+test: images/test
+
+names:
+  0: wake
+

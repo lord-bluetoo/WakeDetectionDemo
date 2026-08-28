@@ -1,14 +1,16 @@
 # Wake Structure Head v1
 
-这是对“先验证显式尾迹结构学习能否改善 OBB 检测表征”这一假设的最小实现：
+这是对显式尾迹结构学习与结构引导特征提取的最小实现：
 
 ```text
 image -> YOLOv8 backbone -> P3/8
-                         |-> 原 YOLOv8n-OBB 检测分支
-                         `-> Structure Head -> P + q_theta
+                         |-> Structure Head -> P + q_theta -> theta + C
+                         |                                  |
+                         `-> residual directional context <- P*C
+                                           `-> YOLOv8n-OBB 检测分支
 ```
 
-第一版没有去噪模块、方向卷积或检测特征门控。Structure Head 只是训练期辅助任务，因此 baseline 和实验组之间唯一新增变量是结构学习约束。
+`configs/structure_v1.yaml` 保留第一版纯辅助任务：Structure Head 只在训练期提供损失，不改变检测前向。默认的 `configs/structure_v2.yaml` 保持完全相同的损失权重，并在 P3 后加入零初始化的残差方向上下文；原始 P3 始终保留，`P*C` 只控制新增方向特征的强度。
 
 ## 实现内容
 
@@ -16,7 +18,9 @@ image -> YOLOv8 backbone -> P3/8
 - `q_theta`：8 个方向 logits，经 softmax 得到 `[0°, 180°)` 上的分布；
 - `theta`：对 `q_theta` 做 180° 周期圆统计得到的连续方向；
 - `C`：双角向量合成后的模长，表示方向分布集中度；
-- `P*C`：预留给后续方向特征门控，本版不回灌检测分支。
+- `P*C`：V1 只做诊断输出；V2 用它软门控新增的方向上下文，不遮蔽原始 P3。
+- V2 方向上下文：沿 `theta` 在 P3 上前后各采样一个位置，将对称上下文与局部特征融合；
+- V2 残差：`P3_out = P3 + tanh(alpha) * (P*C) * D_theta(P3)`，其中 `alpha=0` 初始化。
 
 现有 OBB 不被当作精确结构真值。每个 OBB 只是一个正 MIL bag：框内至少有少量位置应当响应，但不会把整个框标成 wake。框外提供背景约束；OBB 长轴只提供一个低精度、soft-bin 的方向先验；稀疏项限制整框全亮；90°/180° 旋转一致性提供无额外标注的等变约束。
 
@@ -65,11 +69,39 @@ python prepare_swim.py \
 python train_baseline.py --data /path/to/swim.yaml --epochs 50 --fraction 0.2 --device 0
 ```
 
-再跑 Structure Head 组：
+再跑默认的 Structure Head + 残差结构引导组：
 
 ```bash
 python train_structure.py --data /path/to/swim.yaml --epochs 50 --fraction 0.2 --device 0
 ```
+
+要复现实验中的纯辅助 V1，显式传入：
+
+```bash
+python train_structure.py --data /path/to/swim.yaml --structure-config configs/structure_v1.yaml
+```
+
+## Kaggle 一键运行 V2
+
+将本项目和原始 SWIM 数据集挂载到 Kaggle Notebook 后，在一个 Python cell 中运行：
+
+```python
+from pathlib import Path
+import subprocess
+import sys
+
+runner = None
+for root in (Path("/kaggle/working"), Path("/kaggle/input")):
+    candidates = list(root.rglob("kaggle_run_v2.py"))
+    if candidates:
+        runner = min(candidates, key=lambda path: (len(path.parts), path.as_posix()))
+        break
+if runner is None:
+    raise FileNotFoundError("没有找到 kaggle_run_v2.py，请先挂载或上传本项目")
+subprocess.run([sys.executable, str(runner)], check=True)
+```
+
+脚本会自动安装缺失依赖、定位或转换 SWIM、训练 V2、运行 12 图诊断，并在 `/kaggle/working` 生成训练与诊断 ZIP。默认参数是 `epochs=50`、`fraction=0.2`、`seed=42`；可在 `subprocess.run` 的列表末尾追加例如 `"--batch", "8"` 来覆盖。
 
 Kaggle 的交互 Session 可能失效。可给训练命令添加 `--archive`，训练成功后自动把当前 run（包括 `best.pt`、`last.pt`、`results.csv` 和图表）压缩到 `/kaggle/working`：
 
@@ -101,6 +133,7 @@ python diagnose_structure.py \
 - `figures/*.png`：输入与 OBB、`P`、`C`、`P*C`、角度色相和高置信方向场；
 - `diagnostics.csv`：逐图的框内/框外响应、方向集中度、归一化熵和相对 OBB 长轴的方向误差；
 - `summary.json`：均值与显式标为 heuristic 的坍缩筛查标志；
+- V2 的 `summary.json` 还记录 `guidance_alpha` 和实际残差尺度 `tanh(alpha)`；
 - `training_curves.png`：Structure losses 和检测 mAP 曲线；
 - ZIP：完整训练 run 与上述诊断，便于立即下载。
 
@@ -108,11 +141,12 @@ python diagnose_structure.py \
 
 完整 SWIM 实验去掉 `--fraction 0.2`。建议先比较 `mAP50`、`mAP75` 和 `mAP50-95`，并至少重复 3 个 seed。Kaggle 单 GPU 可直接使用；本训练器的 v1 目标是单进程/单 GPU，不支持 DDP。
 
-结构超参数在 `configs/structure_v1.yaml`。若要做最干净的损失消融，可把某一项权重设为 0；若显存紧张，可先将 `enable_equivariance` 设为 `false`，它会省掉旋转图像到 P3 的第二次局部前向。
+V1/V2 结构超参数分别在 `configs/structure_v1.yaml` 和 `configs/structure_v2.yaml`。若要做最干净的损失消融，可把某一项权重设为 0；若显存紧张，可先将 `enable_equivariance` 设为 `false`，它会省掉旋转图像到 P3 的第二次局部前向。
 
 ## 代码入口
 
 - `wake_structure/head.py`：9-channel Structure Head；
+- `wake_structure/guidance.py`：V2 方向采样与零初始化残差增强；
 - `wake_structure/geometry.py`：`q_theta -> theta, C`；
 - `wake_structure/targets.py`：OBB 到 MIL/soft-direction 弱目标；
 - `wake_structure/losses.py`：全部辅助损失；

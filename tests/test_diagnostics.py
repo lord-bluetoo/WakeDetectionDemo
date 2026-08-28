@@ -1,4 +1,5 @@
 import csv
+import json
 from zipfile import ZipFile
 
 import cv2
@@ -131,5 +132,8 @@ def test_end_to_end_diagnostics_bundle(tmp_path, monkeypatch) -> None:
 
     assert (output / "diagnostics.csv").is_file()
     assert (output / "summary.json").is_file()
+    summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
+    assert summary["feature_guidance_enabled"] is False
+    assert summary["guidance_alpha"] is None
     assert len(list((output / "figures").glob("*.png"))) == 1
     assert (tmp_path / "diagnostics_bundle.zip").is_file()

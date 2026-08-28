@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 
 from ultralytics.models import yolo
 from ultralytics.models.yolo.obb.train import OBBTrainer
@@ -15,6 +16,7 @@ from ultralytics.utils import DEFAULT_CFG, RANK
 
 from .config import StructureConfig
 from .geometry import decode_structure
+from .guidance import StructureGuidedExtractor
 from .head import StructureHead
 from .losses import StructureCriterion
 
@@ -33,10 +35,11 @@ def _module_out_channels(module: torch.nn.Module) -> int:
 
 
 class StructureOBBModel(OBBModel):
-    """YOLO OBB model with an auxiliary P3 Structure Head.
+    """YOLO OBB model with a P3 Structure Head and optional feature guidance.
 
-    Detection predictions are unchanged. During training only, the extra loss
-    updates the shared P3/backbone representation and Structure Head parameters.
+    V1 only uses the structure objective as auxiliary supervision. V2 can also
+    feed a zero-initialized, structure-conditioned residual into the layers that
+    follow P3, while preserving the original feature as an identity path.
     """
 
     def __init__(
@@ -59,10 +62,86 @@ class StructureOBBModel(OBBModel):
             num_bins=self.structure_config.num_bins,
             dropout=self.structure_config.dropout,
         )
+        self.feature_guidance = (
+            StructureGuidedExtractor(
+                in_channels=in_channels,
+                hidden_channels=self.structure_config.guidance_hidden_channels,
+                num_bins=self.structure_config.num_bins,
+                sampling_step=self.structure_config.guidance_sampling_step,
+                alpha_init=self.structure_config.guidance_alpha_init,
+            )
+            if self.structure_config.enable_feature_guidance
+            else None
+        )
         self.structure_criterion = StructureCriterion(
             num_bins=self.structure_config.num_bins,
             config=self.structure_config.loss,
         )
+        self._capture_structure_logits = False
+        self._captured_structure_logits: torch.Tensor | None = None
+
+    @staticmethod
+    def _predict_options(args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[Any, Any]:
+        """Accept both older and newer Ultralytics ``_predict_once`` call shapes."""
+
+        visualize = kwargs.pop("visualize", False)
+        embed = kwargs.pop("embed", None)
+        if kwargs:
+            raise TypeError(f"Unexpected prediction options: {sorted(kwargs)}")
+        if len(args) == 1:
+            value = args[0]
+            if value is None or isinstance(value, (list, tuple, set, frozenset)):
+                embed = value
+            else:
+                visualize = value
+        elif len(args) == 2:
+            visualize, embed = args
+        elif len(args) > 2:
+            raise TypeError("Too many positional options for _predict_once().")
+        return visualize, embed
+
+    def _predict_once(self, x: torch.Tensor, profile: bool = False, *args: Any, **kwargs: Any):
+        """Run the Ultralytics graph and inject structure guidance after P3."""
+
+        visualize, embed = self._predict_options(args, kwargs)
+        outputs: list[Any] = []
+        timings: list[float] = []
+        embeddings: list[torch.Tensor] = []
+        embed_indices = frozenset(embed) if embed else {-1}
+        max_embed_index = max(embed_indices)
+        target_index = getattr(getattr(self, "structure_config", None), "p3_layer_index", -1)
+
+        for module in self.model:
+            if module.f != -1:
+                x = (
+                    outputs[module.f]
+                    if isinstance(module.f, int)
+                    else [x if index == -1 else outputs[index] for index in module.f]
+                )
+            if profile:
+                self._profile_one_layer(module, x, timings)
+            x = module(x)
+
+            if module.i == target_index and hasattr(self, "structure_head"):
+                structure_logits = self.structure_head(x)
+                if self._capture_structure_logits:
+                    self._captured_structure_logits = structure_logits
+                if self.feature_guidance is not None:
+                    x = self.feature_guidance(x, structure_logits)
+
+            outputs.append(x if module.i in self.save else None)
+            if visualize:
+                try:
+                    from ultralytics.utils.plotting import feature_visualization
+
+                    feature_visualization(x, module.type, module.i, save_dir=visualize)
+                except ImportError:
+                    pass
+            if module.i in embed_indices:
+                embeddings.append(F.adaptive_avg_pool2d(x, (1, 1)).squeeze(-1).squeeze(-1))
+                if module.i == max_embed_index:
+                    return torch.unbind(torch.cat(embeddings, 1), dim=0)
+        return x
 
     def _extract_p3(self, images: torch.Tensor) -> torch.Tensor:
         """Run the graph only up to the configured P3 tap."""
@@ -85,34 +164,25 @@ class StructureOBBModel(OBBModel):
                 return value
         raise RuntimeError(f"P3 layer {target_index} was not reached.")
 
-    def _predict_and_capture_p3(self, images: torch.Tensor) -> tuple[Any, torch.Tensor]:
-        captured: dict[str, torch.Tensor] = {}
-
-        def capture(_module: torch.nn.Module, _inputs: tuple[Any, ...], output: Any) -> None:
-            if not isinstance(output, torch.Tensor):
-                raise TypeError("The configured P3 layer must produce a tensor.")
-            captured["feature"] = output
-
-        handle = self.model[self.structure_config.p3_layer_index].register_forward_hook(capture)
-        try:
-            predictions = self.forward(images)
-        finally:
-            handle.remove()
-        if "feature" not in captured:
-            raise RuntimeError("Failed to capture the configured P3 feature.")
-        return predictions, captured["feature"]
-
     def loss(self, batch: dict[str, torch.Tensor], preds: Any = None):
         if getattr(self, "criterion", None) is None:
             self.criterion = self.init_criterion()
 
         if preds is None:
-            preds, p3 = self._predict_and_capture_p3(batch["img"])
+            self._captured_structure_logits = None
+            self._capture_structure_logits = True
+            try:
+                preds = self.forward(batch["img"])
+            finally:
+                self._capture_structure_logits = False
+            structure_logits = self._captured_structure_logits
+            self._captured_structure_logits = None
+            if structure_logits is None:
+                raise RuntimeError("Failed to capture structure logits during detection forward.")
         else:
             # Ultralytics compile=True calculates predictions before calling loss.
             p3 = self._extract_p3(batch["img"])
-
-        structure_logits = self.structure_head(p3)
+            structure_logits = self.structure_head(p3)
         rotated_logits = None
         quarter_turns = 0
         if self.training and self.structure_config.enable_equivariance:
@@ -183,4 +253,3 @@ class StructureOBBTrainer(OBBTrainer):
             args=copy(self.args),
             _callbacks=self.callbacks,
         )
-

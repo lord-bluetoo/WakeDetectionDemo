@@ -52,13 +52,17 @@ class StructureLossConfig:
 
 @dataclass(frozen=True)
 class StructureConfig:
-    """Architecture and loss configuration for :class:`StructureHead`."""
+    """Architecture, guidance, and loss configuration for the structure model."""
 
     num_bins: int = 8
     p3_layer_index: int = 4
     hidden_channels: int = 64
     dropout: float = 0.0
     enable_equivariance: bool = True
+    enable_feature_guidance: bool = False
+    guidance_hidden_channels: int = 64
+    guidance_sampling_step: float = 1.0
+    guidance_alpha_init: float = 0.0
     loss: StructureLossConfig = field(default_factory=StructureLossConfig)
 
     def __post_init__(self) -> None:
@@ -68,6 +72,10 @@ class StructureConfig:
             raise ValueError("p3_layer_index must be non-negative.")
         if self.hidden_channels < 1:
             raise ValueError("hidden_channels must be positive.")
+        if self.guidance_hidden_channels < 1:
+            raise ValueError("guidance_hidden_channels must be positive.")
+        if self.guidance_sampling_step <= 0:
+            raise ValueError("guidance_sampling_step must be positive.")
         if not 0 <= self.dropout < 1:
             raise ValueError("dropout must be in [0, 1).")
 
@@ -85,4 +93,3 @@ class StructureConfig:
         if not isinstance(values, dict):
             raise TypeError("Structure config YAML must contain a mapping at the top level.")
         return cls.from_dict(values)
-

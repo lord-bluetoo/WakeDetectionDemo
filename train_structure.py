@@ -12,7 +12,7 @@ from wake_structure.model import StructureOBBTrainer
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", required=True, help="Ultralytics OBB dataset YAML")
-    parser.add_argument("--structure-config", default="configs/structure_v1.yaml")
+    parser.add_argument("--structure-config", default="configs/structure_v2.yaml")
     parser.add_argument("--model", default="yolov8n-obb.pt")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--imgsz", type=int, default=640)
@@ -22,7 +22,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fraction", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--project", default="runs/wake_ablation")
-    parser.add_argument("--name", default="yolov8n_obb_structure_v1")
+    parser.add_argument("--name", default="yolov8n_obb_structure_v2")
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--archive", help="Optional .zip destination created after successful training")
     return parser.parse_args()

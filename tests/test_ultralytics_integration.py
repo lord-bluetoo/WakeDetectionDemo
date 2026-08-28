@@ -11,6 +11,7 @@ from ultralytics.cfg import get_cfg
 def test_yolov8_obb_structure_model_minimal_forward_and_loss() -> None:
     config = StructureConfig(
         enable_equivariance=False,
+        enable_feature_guidance=True,
         loss=StructureLossConfig(equivariance_weight=0.0),
     )
     model = StructureOBBModel("yolov8n-obb.yaml", nc=1, verbose=False, structure_config=config)
@@ -29,6 +30,9 @@ def test_yolov8_obb_structure_model_minimal_forward_and_loss() -> None:
     assert torch.isfinite(loss_vector).all()
     loss_vector.sum().backward()
     assert model.structure_head.output.weight.grad is not None
+    assert model.feature_guidance is not None
+    assert model.feature_guidance.alpha.grad is not None
+    assert torch.isfinite(model.feature_guidance.alpha.grad)
 
     maps = model.structure_maps(batch["img"])
     assert maps["presence"].shape[1] == 1

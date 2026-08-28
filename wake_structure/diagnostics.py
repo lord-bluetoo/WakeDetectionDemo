@@ -478,8 +478,15 @@ def run_diagnostics(
         writer.writeheader()
         writer.writerows(rows)
     summary = summarize_rows(rows)
+    feature_guidance = getattr(model, "feature_guidance", None)
+    guidance_alpha = (
+        float(feature_guidance.alpha.detach().float().cpu()) if feature_guidance is not None else None
+    )
     summary.update(
         {
+            "feature_guidance_enabled": feature_guidance is not None,
+            "guidance_alpha": guidance_alpha,
+            "guidance_residual_scale": math.tanh(guidance_alpha) if guidance_alpha is not None else None,
             "weights": str(Path(weights).resolve()),
             "data": str(Path(data_yaml).resolve()),
             "split": split,

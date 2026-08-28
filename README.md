@@ -71,6 +71,41 @@ python train_baseline.py --data /path/to/swim.yaml --epochs 50 --fraction 0.2 --
 python train_structure.py --data /path/to/swim.yaml --epochs 50 --fraction 0.2 --device 0
 ```
 
+Kaggle 的交互 Session 可能失效。可给训练命令添加 `--archive`，训练成功后自动把当前 run（包括 `best.pt`、`last.pt`、`results.csv` 和图表）压缩到 `/kaggle/working`：
+
+```bash
+python train_structure.py \
+  --data /kaggle/working/swim_yolo_obb_raw/swim.yaml \
+  --epochs 50 --fraction 0.2 --imgsz 640 --batch 16 --device 0 --seed 42 \
+  --name pilot20_structure_s42 \
+  --archive /kaggle/working/pilot20_structure_s42.zip
+```
+
+Baseline 入口同样支持 `--archive`。
+
+## Structure Head 诊断
+
+在决定是否把 `P/C` 接回检测分支之前，先对 Structure 权重运行固定样本诊断：
+
+```bash
+python diagnose_structure.py \
+  --weights /kaggle/working/WakeDetectionDemo/runs/obb/runs/wake_ablation/pilot20_structure_s42/weights/best.pt \
+  --data /kaggle/working/swim_yolo_obb_raw/swim.yaml \
+  --split val --num-images 12 --imgsz 640 --device 0 --seed 42 \
+  --output /kaggle/working/structure_diagnostics_s42 \
+  --archive /kaggle/working/structure_diagnostics_s42.zip
+```
+
+输出包括：
+
+- `figures/*.png`：输入与 OBB、`P`、`C`、`P*C`、角度色相和高置信方向场；
+- `diagnostics.csv`：逐图的框内/框外响应、方向集中度、归一化熵和相对 OBB 长轴的方向误差；
+- `summary.json`：均值与显式标为 heuristic 的坍缩筛查标志；
+- `training_curves.png`：Structure losses 和检测 mAP 曲线；
+- ZIP：完整训练 run 与上述诊断，便于立即下载。
+
+`summary.json` 中的阈值只用于快速筛查，不是显著性检验。定性图仍是判断该弱监督是否真的定位尾迹结构的主要证据。
+
 完整 SWIM 实验去掉 `--fraction 0.2`。建议先比较 `mAP50`、`mAP75` 和 `mAP50-95`，并至少重复 3 个 seed。Kaggle 单 GPU 可直接使用；本训练器的 v1 目标是单进程/单 GPU，不支持 DDP。
 
 结构超参数在 `configs/structure_v1.yaml`。若要做最干净的损失消融，可把某一项权重设为 0；若显存紧张，可先将 `enable_equivariance` 设为 `false`，它会省掉旋转图像到 P3 的第二次局部前向。

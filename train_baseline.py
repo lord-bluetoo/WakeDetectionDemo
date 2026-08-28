@@ -6,6 +6,8 @@ import argparse
 
 from ultralytics import YOLO
 
+from wake_structure.artifacts import create_archive
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
@@ -20,12 +22,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--project", default="runs/wake_ablation")
     parser.add_argument("--name", default="yolov8n_obb_baseline")
+    parser.add_argument("--archive", help="Optional .zip destination created after successful training")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    YOLO(args.model).train(
+    model = YOLO(args.model)
+    model.train(
         data=args.data,
         epochs=args.epochs,
         imgsz=args.imgsz,
@@ -39,8 +43,10 @@ def main() -> None:
         name=args.name,
         task="obb",
     )
+    if args.archive:
+        archive = create_archive([model.trainer.save_dir], args.archive)
+        print(f"Run archive: {archive}")
 
 
 if __name__ == "__main__":
     main()
-

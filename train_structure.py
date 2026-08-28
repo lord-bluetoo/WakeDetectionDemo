@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 
+from wake_structure.artifacts import create_archive
 from wake_structure.config import StructureConfig
 from wake_structure.model import StructureOBBTrainer
 
@@ -23,6 +24,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--project", default="runs/wake_ablation")
     parser.add_argument("--name", default="yolov8n_obb_structure_v1")
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--archive", help="Optional .zip destination created after successful training")
     return parser.parse_args()
 
 
@@ -47,8 +49,10 @@ def main() -> None:
     }
     trainer = StructureOBBTrainer(overrides=overrides, structure_config=structure_config)
     trainer.train()
+    if args.archive:
+        archive = create_archive([trainer.save_dir], args.archive)
+        print(f"Run archive: {archive}")
 
 
 if __name__ == "__main__":
     main()
-

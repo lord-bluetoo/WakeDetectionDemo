@@ -1,0 +1,24 @@
+# V2: keep the V1 auxiliary objective unchanged and explicitly feed
+# structure-conditioned directional context back into the P3 feature path.
+num_bins: 8
+p3_layer_index: 4
+hidden_channels: 64
+dropout: 0.0
+enable_equivariance: true
+
+enable_feature_guidance: true
+guidance_hidden_channels: 64
+guidance_sampling_step: 1.0
+guidance_alpha_init: 0.0
+
+loss:
+  mil_weight: 1.0
+  background_weight: 0.25
+  orientation_weight: 0.25
+  sparse_weight: 0.05
+  equivariance_weight: 0.10
+  mil_topk_fraction: 0.10
+  max_foreground_fraction: 0.25
+  orientation_kappa: 4.0
+  roi_margin: 0.05
+  orientation_presence_floor: 0.10

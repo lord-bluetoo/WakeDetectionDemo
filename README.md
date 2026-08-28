@@ -83,25 +83,53 @@ python train_structure.py --data /path/to/swim.yaml --structure-config configs/s
 
 ## Kaggle 一键运行 V2
 
-将本项目和原始 SWIM 数据集挂载到 Kaggle Notebook 后，在一个 Python cell 中运行：
+先把当前 V2 代码推送到 GitHub，并将原始 SWIM 数据集挂载到 Kaggle Notebook。开启 GPU 和 Internet 后，在一个 Python cell 中运行：
 
 ```python
+import os
 from pathlib import Path
 import subprocess
 import sys
 
-runner = None
-for root in (Path("/kaggle/working"), Path("/kaggle/input")):
-    candidates = list(root.rglob("kaggle_run_v2.py"))
-    if candidates:
-        runner = min(candidates, key=lambda path: (len(path.parts), path.as_posix()))
-        break
-if runner is None:
-    raise FileNotFoundError("没有找到 kaggle_run_v2.py，请先挂载或上传本项目")
-subprocess.run([sys.executable, str(runner)], check=True)
+os.environ["PYDEVD_DISABLE_FILE_VALIDATION"] = "1"
+os.environ["WANDB_DISABLED"] = "true"
+
+REPO_URL = "https://github.com/lord-bluetoo/WakeDetectionDemo.git"
+BRANCH = "main"
+PROJECT = Path("/kaggle/working/WakeDetectionDemo")
+
+def run(command, cwd=None):
+    print("$", " ".join(map(str, command)), flush=True)
+    subprocess.run(list(map(str, command)), cwd=cwd, check=True)
+
+if (PROJECT / ".git").is_dir():
+    run(["git", "-C", PROJECT, "pull", "--ff-only", "origin", BRANCH])
+elif PROJECT.exists():
+    raise RuntimeError(f"{PROJECT} 已存在但不是 Git 仓库，请更换 PROJECT 路径")
+else:
+    run(["git", "clone", "--depth", "1", "--branch", BRANCH, REPO_URL, PROJECT])
+
+runner = PROJECT / "kaggle_run_v2.py"
+if not runner.is_file():
+    raise FileNotFoundError(
+        f"远端 {BRANCH} 分支没有 kaggle_run_v2.py；请先将本地 V2 改动提交并推送到 GitHub"
+    )
+
+run([
+    sys.executable,
+    runner,
+    "--epochs", "50",
+    "--fraction", "0.2",
+    "--imgsz", "640",
+    "--batch", "16",
+    "--device", "0",
+    "--workers", "2",
+    "--seed", "42",
+    "--name", "pilot20_structure_guided_s42",
+])
 ```
 
-脚本会自动安装缺失依赖、定位或转换 SWIM、训练 V2、运行 12 图诊断，并在 `/kaggle/working` 生成训练与诊断 ZIP。默认参数是 `epochs=50`、`fraction=0.2`、`seed=42`；可在 `subprocess.run` 的列表末尾追加例如 `"--batch", "8"` 来覆盖。
+该 cell 会从 GitHub 克隆或更新项目；`kaggle_run_v2.py` 随后自动安装缺失依赖、定位或转换 SWIM、查找预训练权重、训练 V2、运行 12 图诊断，并在 `/kaggle/working` 生成训练与诊断 ZIP。显存不足时把 `"--batch", "16"` 改为 `"--batch", "8"`。
 
 Kaggle 的交互 Session 可能失效。可给训练命令添加 `--archive`，训练成功后自动把当前 run（包括 `best.pt`、`last.pt`、`results.csv` 和图表）压缩到 `/kaggle/working`：
 

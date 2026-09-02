@@ -1,4 +1,4 @@
-"""Weakly supervised objectives for the Structure Head."""
+"""Losses for landmark-supervised wake geometry."""
 
 from __future__ import annotations
 
@@ -8,112 +8,90 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from .config import StructureLossConfig
-from .head import split_structure_logits
-from .targets import build_weak_structure_targets
+from .config import GeometryLossConfig
+from .head import split_geometry_logits
+from .targets import build_geometry_targets
 
 
-def _differentiable_zero(reference: torch.Tensor) -> torch.Tensor:
+def _zero(reference: torch.Tensor) -> torch.Tensor:
     return reference.sum() * 0.0
 
 
-class StructureCriterion(nn.Module):
-    """MIL + background + soft orientation + sparsity + rotation consistency."""
+def _heatmap_focal_loss(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    probability = logits.sigmoid().clamp(1e-6, 1 - 1e-6)
+    positive = target.eq(1)
+    negative = ~positive
+    positive_loss = -(1 - probability).square() * probability.log() * positive
+    negative_loss = -(probability.square()) * (1 - probability).log() * (1 - target).pow(4) * negative
+    count = positive.sum().clamp_min(1)
+    return (positive_loss.sum() + negative_loss.sum()) / count
 
-    def __init__(self, num_bins: int, config: StructureLossConfig) -> None:
+
+class GeometryCriterion(nn.Module):
+    def __init__(self, num_bins: int, config: GeometryLossConfig) -> None:
         super().__init__()
         self.num_bins = num_bins
         self.config = config
 
-    def forward(
-        self,
-        logits: torch.Tensor,
-        batch: dict[str, torch.Tensor],
-        *,
-        rotated_logits: torch.Tensor | None = None,
-        quarter_turns: int = 0,
-    ) -> dict[str, torch.Tensor]:
-        presence_logits, orientation_logits = split_structure_logits(logits, self.num_bins)
-        targets = build_weak_structure_targets(
+    def forward(self, logits: torch.Tensor, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        parts = split_geometry_logits(logits, self.num_bins)
+        targets = build_geometry_targets(
             batch,
             feature_size=logits.shape[-2:],
             num_bins=self.num_bins,
-            orientation_kappa=self.config.orientation_kappa,
+            direction_kappa=self.config.direction_kappa,
             roi_margin=self.config.roi_margin,
+            tip_radius=self.config.tip_radius,
         )
-        presence = presence_logits.sigmoid()
 
-        mil = _differentiable_zero(logits)
+        presence = parts.structure.sigmoid()
+        mil = _zero(logits)
         for mask, image_index in zip(targets.instance_masks, targets.instance_batch_indices):
             values = presence[int(image_index.item()), 0][mask]
             count = max(1, math.ceil(values.numel() * self.config.mil_topk_fraction))
-            pooled = values.topk(count).values.mean()
-            mil = mil - torch.log(pooled.clamp_min(1e-6))
+            mil = mil - torch.log(values.topk(count).values.mean().clamp_min(1e-6))
         if len(targets.instance_masks):
             mil = mil / len(targets.instance_masks)
 
         outside = 1.0 - targets.roi_mask
-        outside_count = outside.sum()
-        background = (
-            (F.softplus(presence_logits) * outside).sum() / outside_count.clamp_min(1)
-            if outside_count > 0
-            else _differentiable_zero(logits)
-        )
-        presence_loss = self.config.mil_weight * mil + self.config.background_weight * background
-
-        log_q = orientation_logits.log_softmax(dim=1)
-        direction_ce = -(targets.orientation_distribution * log_q).sum(dim=1, keepdim=True)
-        direction_weight = targets.orientation_mask * (
-            self.config.orientation_presence_floor
-            + (1.0 - self.config.orientation_presence_floor) * presence.detach()
-        )
-        orientation_loss = (direction_ce * direction_weight).sum() / direction_weight.sum().clamp_min(1)
-        orientation_loss = self.config.orientation_weight * orientation_loss
-
-        sparse = _differentiable_zero(logits)
+        background = (F.softplus(parts.structure) * outside).sum() / outside.sum().clamp_min(1)
+        sparse = _zero(logits)
         valid_images = 0
         for image_index in range(logits.shape[0]):
             inside = targets.roi_mask[image_index].bool()
             if inside.any():
-                fraction = presence[image_index][inside].mean()
-                sparse = sparse + F.relu(fraction - self.config.max_foreground_fraction).square()
+                sparse = sparse + F.relu(
+                    presence[image_index][inside].mean() - self.config.max_foreground_fraction
+                ).square()
                 valid_images += 1
         if valid_images:
             sparse = sparse / valid_images
-        sparse_loss = self.config.sparse_weight * sparse
+        structure_loss = (
+            self.config.mil_weight * mil
+            + self.config.background_weight * background
+            + self.config.sparse_weight * sparse
+        )
 
-        equivariance_loss = _differentiable_zero(logits)
-        if rotated_logits is not None and self.config.equivariance_weight:
-            equivariance_loss = self._equivariance_loss(logits, rotated_logits, quarter_turns)
-            equivariance_loss = self.config.equivariance_weight * equivariance_loss
+        tip_loss = self.config.tip_weight * _heatmap_focal_loss(parts.tip, targets.tip_heatmap)
+
+        offset_loss = _zero(logits)
+        if len(targets.tip_indices):
+            y, x = targets.tip_indices.unbind(dim=1)
+            predicted_offsets = parts.offset.sigmoid()[targets.tip_batch_indices, :, y, x]
+            offset_loss = F.smooth_l1_loss(predicted_offsets, targets.tip_offsets)
+        offset_loss = self.config.offset_weight * offset_loss
+
+        direction_weight = targets.direction_mask
+        arm1_ce = -(targets.arm1_distribution * parts.arm1.log_softmax(dim=1)).sum(dim=1, keepdim=True)
+        arm2_ce = -(targets.arm2_distribution * parts.arm2.log_softmax(dim=1)).sum(dim=1, keepdim=True)
+        arm_loss = ((arm1_ce + arm2_ce) * direction_weight).sum()
+        arm_loss = arm_loss / (2 * direction_weight.sum().clamp_min(1))
+        arm_loss = self.config.arm_weight * arm_loss
 
         return {
-            "structure_presence_loss": presence_loss,
-            "structure_orientation_loss": orientation_loss,
-            "structure_sparse_loss": sparse_loss,
-            "structure_equivariance_loss": equivariance_loss,
+            "geometry_structure_loss": structure_loss,
+            "geometry_tip_loss": tip_loss,
+            "geometry_offset_loss": offset_loss,
+            "geometry_arm_loss": arm_loss,
         }
-
-    def _equivariance_loss(
-        self,
-        logits: torch.Tensor,
-        rotated_logits: torch.Tensor,
-        quarter_turns: int,
-    ) -> torch.Tensor:
-        turns = quarter_turns % 4
-        presence_logits, orientation_logits = split_structure_logits(logits, self.num_bins)
-        rotated_presence_logits, rotated_orientation_logits = split_structure_logits(rotated_logits, self.num_bins)
-
-        aligned_presence = torch.rot90(rotated_presence_logits.sigmoid(), -turns, dims=(-2, -1))
-        aligned_q = torch.rot90(rotated_orientation_logits.softmax(dim=1), -turns, dims=(-2, -1))
-        # A 90-degree image turn moves an axial direction by K/2 bins.
-        aligned_q = torch.roll(aligned_q, shifts=-(turns * self.num_bins // 2), dims=1)
-
-        presence = presence_logits.sigmoid()
-        q = orientation_logits.softmax(dim=1)
-        presence_consistency = F.smooth_l1_loss(aligned_presence, presence)
-        direction_weight = ((aligned_presence + presence) / 2).detach()
-        direction_consistency = ((aligned_q - q).square().sum(dim=1, keepdim=True) * direction_weight).sum()
-        direction_consistency = direction_consistency / direction_weight.sum().clamp_min(1)
-        return presence_consistency + direction_consistency
 

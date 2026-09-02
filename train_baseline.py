@@ -20,8 +20,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--fraction", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--project", default="runs/wake_ablation")
+    parser.add_argument("--project", default="runs/wake_geometry")
     parser.add_argument("--name", default="yolov8n_obb_baseline")
+    parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--archive", help="Optional .zip destination created after successful training")
     return parser.parse_args()
 
@@ -39,9 +40,13 @@ def main() -> None:
         fraction=args.fraction,
         seed=args.seed,
         deterministic=True,
+        amp=args.amp,
         project=args.project,
         name=args.name,
         task="obb",
+        mosaic=0.0,
+        mixup=0.0,
+        copy_paste=0.0,
     )
     if args.archive:
         archive = create_archive([model.trainer.save_dir], args.archive)

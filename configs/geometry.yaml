@@ -1,0 +1,23 @@
+num_bins: 16
+p3_layer_index: 4
+hidden_channels: 64
+dropout: 0.0
+
+enable_refinement: true
+refinement_hidden_channels: 64
+sampling_step: 1.0
+denoise_scale_init: 0.0
+feature_scale_init: 0.0
+
+loss:
+  mil_weight: 1.0
+  background_weight: 0.25
+  sparse_weight: 0.05
+  tip_weight: 1.0
+  offset_weight: 0.25
+  arm_weight: 0.5
+  mil_topk_fraction: 0.10
+  max_foreground_fraction: 0.25
+  direction_kappa: 8.0
+  roi_margin: 0.05
+  tip_radius: 2

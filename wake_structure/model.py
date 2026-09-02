@@ -1,4 +1,4 @@
-"""Ultralytics YOLOv8-OBB integration for the auxiliary Structure Head."""
+"""YOLOv8-OBB integration for landmark-supervised wake geometry."""
 
 from __future__ import annotations
 
@@ -12,35 +12,28 @@ import torch.nn.functional as F
 from ultralytics.models import yolo
 from ultralytics.models.yolo.obb.train import OBBTrainer
 from ultralytics.nn.tasks import OBBModel
-from ultralytics.utils import DEFAULT_CFG, RANK
+from ultralytics.utils import DEFAULT_CFG, RANK, colorstr
+from ultralytics.utils.torch_utils import unwrap_model
 
-from .config import StructureConfig
-from .geometry import decode_structure
-from .guidance import StructureGuidedExtractor
-from .head import StructureHead
-from .losses import StructureCriterion
+from .config import GeometryConfig
+from .dataset import GeometryYOLODataset
+from .geometry import decode_geometry
+from .guidance import GeometryGuidedRefinement
+from .head import GeometryHead
+from .losses import GeometryCriterion
 
 
 def _module_out_channels(module: torch.nn.Module) -> int:
-    """Infer the output width of common Ultralytics blocks without a dummy pass."""
-
     for candidate in (getattr(module, "cv2", None), getattr(module, "conv", None), module):
         conv = getattr(candidate, "conv", candidate)
         if isinstance(conv, torch.nn.Conv2d):
             return conv.out_channels
     convolutions = [item for item in module.modules() if isinstance(item, torch.nn.Conv2d)]
-    if convolutions:
-        return convolutions[-1].out_channels
-    raise TypeError(f"Cannot infer output channels for layer {module!r}")
+    return convolutions[-1].out_channels
 
 
-class StructureOBBModel(OBBModel):
-    """YOLO OBB model with a P3 Structure Head and optional feature guidance.
-
-    V1 only uses the structure objective as auxiliary supervision. V2 can also
-    feed a zero-initialized, structure-conditioned residual into the layers that
-    follow P3, while preserving the original feature as an identity path.
-    """
+class GeometryOBBModel(OBBModel):
+    """OBB detector with a P3 geometry head and geometry-guided refinement."""
 
     def __init__(
         self,
@@ -48,46 +41,38 @@ class StructureOBBModel(OBBModel):
         ch: int = 3,
         nc: int | None = None,
         verbose: bool = True,
-        structure_config: StructureConfig | None = None,
+        geometry_config: GeometryConfig | None = None,
     ) -> None:
         super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
-        self.structure_config = structure_config or StructureConfig()
-        layer_index = self.structure_config.p3_layer_index
-        if layer_index >= len(self.model):
-            raise IndexError(f"P3 layer {layer_index} is outside a {len(self.model)}-layer model.")
+        self.geometry_config = geometry_config or GeometryConfig()
+        layer_index = self.geometry_config.p3_layer_index
         in_channels = _module_out_channels(self.model[layer_index])
-        self.structure_head = StructureHead(
-            in_channels=in_channels,
-            hidden_channels=self.structure_config.hidden_channels,
-            num_bins=self.structure_config.num_bins,
-            dropout=self.structure_config.dropout,
+        self.geometry_head = GeometryHead(
+            in_channels,
+            hidden_channels=self.geometry_config.hidden_channels,
+            num_bins=self.geometry_config.num_bins,
+            dropout=self.geometry_config.dropout,
         )
-        self.feature_guidance = (
-            StructureGuidedExtractor(
-                in_channels=in_channels,
-                hidden_channels=self.structure_config.guidance_hidden_channels,
-                num_bins=self.structure_config.num_bins,
-                sampling_step=self.structure_config.guidance_sampling_step,
-                alpha_init=self.structure_config.guidance_alpha_init,
+        self.geometry_refinement = (
+            GeometryGuidedRefinement(
+                in_channels,
+                hidden_channels=self.geometry_config.refinement_hidden_channels,
+                num_bins=self.geometry_config.num_bins,
+                sampling_step=self.geometry_config.sampling_step,
+                denoise_scale_init=self.geometry_config.denoise_scale_init,
+                feature_scale_init=self.geometry_config.feature_scale_init,
             )
-            if self.structure_config.enable_feature_guidance
+            if self.geometry_config.enable_refinement
             else None
         )
-        self.structure_criterion = StructureCriterion(
-            num_bins=self.structure_config.num_bins,
-            config=self.structure_config.loss,
-        )
-        self._capture_structure_logits = False
-        self._captured_structure_logits: torch.Tensor | None = None
+        self.geometry_criterion = GeometryCriterion(self.geometry_config.num_bins, self.geometry_config.loss)
+        self._capture_geometry = False
+        self._captured_geometry: torch.Tensor | None = None
 
     @staticmethod
     def _predict_options(args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[Any, Any]:
-        """Accept both older and newer Ultralytics ``_predict_once`` call shapes."""
-
         visualize = kwargs.pop("visualize", False)
         embed = kwargs.pop("embed", None)
-        if kwargs:
-            raise TypeError(f"Unexpected prediction options: {sorted(kwargs)}")
         if len(args) == 1:
             value = args[0]
             if value is None or isinstance(value, (list, tuple, set, frozenset)):
@@ -96,47 +81,34 @@ class StructureOBBModel(OBBModel):
                 visualize = value
         elif len(args) == 2:
             visualize, embed = args
-        elif len(args) > 2:
-            raise TypeError("Too many positional options for _predict_once().")
         return visualize, embed
 
     def _predict_once(self, x: torch.Tensor, profile: bool = False, *args: Any, **kwargs: Any):
-        """Run the Ultralytics graph and inject structure guidance after P3."""
-
         visualize, embed = self._predict_options(args, kwargs)
         outputs: list[Any] = []
         timings: list[float] = []
         embeddings: list[torch.Tensor] = []
         embed_indices = frozenset(embed) if embed else {-1}
         max_embed_index = max(embed_indices)
-        target_index = getattr(getattr(self, "structure_config", None), "p3_layer_index", -1)
+        target_index = getattr(getattr(self, "geometry_config", None), "p3_layer_index", -1)
 
         for module in self.model:
             if module.f != -1:
-                x = (
-                    outputs[module.f]
-                    if isinstance(module.f, int)
-                    else [x if index == -1 else outputs[index] for index in module.f]
-                )
+                x = outputs[module.f] if isinstance(module.f, int) else [x if i == -1 else outputs[i] for i in module.f]
             if profile:
                 self._profile_one_layer(module, x, timings)
             x = module(x)
-
-            if module.i == target_index and hasattr(self, "structure_head"):
-                structure_logits = self.structure_head(x)
-                if self._capture_structure_logits:
-                    self._captured_structure_logits = structure_logits
-                if self.feature_guidance is not None:
-                    x = self.feature_guidance(x, structure_logits)
-
+            if module.i == target_index and hasattr(self, "geometry_head"):
+                geometry_logits = self.geometry_head(x)
+                if self._capture_geometry:
+                    self._captured_geometry = geometry_logits
+                if self.geometry_refinement is not None:
+                    x = self.geometry_refinement(x, geometry_logits)
             outputs.append(x if module.i in self.save else None)
             if visualize:
-                try:
-                    from ultralytics.utils.plotting import feature_visualization
+                from ultralytics.utils.plotting import feature_visualization
 
-                    feature_visualization(x, module.type, module.i, save_dir=visualize)
-                except ImportError:
-                    pass
+                feature_visualization(x, module.type, module.i, save_dir=visualize)
             if module.i in embed_indices:
                 embeddings.append(F.adaptive_avg_pool2d(x, (1, 1)).squeeze(-1).squeeze(-1))
                 if module.i == max_embed_index:
@@ -144,102 +116,90 @@ class StructureOBBModel(OBBModel):
         return x
 
     def _extract_p3(self, images: torch.Tensor) -> torch.Tensor:
-        """Run the graph only up to the configured P3 tap."""
-
         outputs: list[Any] = []
         value: Any = images
-        target_index = self.structure_config.p3_layer_index
         for module in self.model:
             if module.f != -1:
                 value = (
                     outputs[module.f]
                     if isinstance(module.f, int)
-                    else [value if index == -1 else outputs[index] for index in module.f]
+                    else [value if i == -1 else outputs[i] for i in module.f]
                 )
             value = module(value)
             outputs.append(value if module.i in self.save else None)
-            if module.i == target_index:
-                if not isinstance(value, torch.Tensor):
-                    raise TypeError(f"Configured P3 layer {target_index} did not return a tensor.")
+            if module.i == self.geometry_config.p3_layer_index:
                 return value
-        raise RuntimeError(f"P3 layer {target_index} was not reached.")
+        raise RuntimeError("Configured P3 layer was not reached.")
 
     def loss(self, batch: dict[str, torch.Tensor], preds: Any = None):
         if getattr(self, "criterion", None) is None:
             self.criterion = self.init_criterion()
-
         if preds is None:
-            self._captured_structure_logits = None
-            self._capture_structure_logits = True
+            self._captured_geometry = None
+            self._capture_geometry = True
             try:
                 preds = self.forward(batch["img"])
             finally:
-                self._capture_structure_logits = False
-            structure_logits = self._captured_structure_logits
-            self._captured_structure_logits = None
-            if structure_logits is None:
-                raise RuntimeError("Failed to capture structure logits during detection forward.")
+                self._capture_geometry = False
+            geometry_logits = self._captured_geometry
         else:
-            # Ultralytics compile=True calculates predictions before calling loss.
-            p3 = self._extract_p3(batch["img"])
-            structure_logits = self.structure_head(p3)
-        rotated_logits = None
-        quarter_turns = 0
-        if self.training and self.structure_config.enable_equivariance:
-            height, width = batch["img"].shape[-2:]
-            if height == width:
-                quarter_turns = int(torch.randint(1, 4, (), device=batch["img"].device).item())
-            else:
-                quarter_turns = 2
-            rotated_images = torch.rot90(batch["img"], quarter_turns, dims=(-2, -1))
-            rotated_logits = self.structure_head(self._extract_p3(rotated_images))
+            geometry_logits = self.geometry_head(self._extract_p3(batch["img"]))
+        if geometry_logits is None:
+            raise RuntimeError("Geometry logits were not captured during the detection forward pass.")
 
         detection_loss, loss_items = self.criterion(preds, batch)
-        structure_items = self.structure_criterion(
-            structure_logits,
-            batch,
-            rotated_logits=rotated_logits,
-            quarter_turns=quarter_turns,
-        )
-        batch_size = batch["img"].shape[0]
-        auxiliary_vector = torch.stack(tuple(structure_items.values())) * batch_size
-        total_vector = torch.cat((detection_loss.reshape(-1), auxiliary_vector))
+        geometry_items = self.geometry_criterion(geometry_logits, batch)
+        auxiliary = torch.stack(tuple(geometry_items.values())) * batch["img"].shape[0]
+        total_vector = torch.cat((detection_loss.reshape(-1), auxiliary))
         logged_items = dict(loss_items)
-        logged_items.update({name: value.detach() for name, value in structure_items.items()})
+        logged_items.update({name: value.detach() for name, value in geometry_items.items()})
         return total_vector, logged_items
 
-    def structure_maps(self, images: torch.Tensor) -> dict[str, torch.Tensor]:
-        """Return P, q_theta, theta, C, and P*C without running the OBB head."""
+    def geometry_maps(self, images: torch.Tensor) -> dict[str, torch.Tensor]:
+        logits = self.geometry_head(self._extract_p3(images))
+        return decode_geometry(logits, self.geometry_config.num_bins)
 
-        return decode_structure(self.structure_head(self._extract_p3(images)))
 
-
-class StructureOBBTrainer(OBBTrainer):
-    """Single-process Ultralytics trainer that constructs :class:`StructureOBBModel`."""
-
+class GeometryOBBTrainer(OBBTrainer):
     def __init__(
         self,
         cfg=DEFAULT_CFG,
         overrides: dict | None = None,
         _callbacks: dict | None = None,
-        structure_config: StructureConfig | None = None,
+        geometry_config: GeometryConfig | None = None,
     ) -> None:
-        self.structure_config = structure_config or StructureConfig()
+        self.geometry_config = geometry_config or GeometryConfig()
         super().__init__(cfg=cfg, overrides=overrides, _callbacks=_callbacks)
 
+    def build_dataset(self, img_path: str, mode: str = "train", batch: int | None = None):
+        stride = max(int(unwrap_model(self.model).stride.max()), 32)
+        return GeometryYOLODataset(
+            img_path=img_path,
+            imgsz=self.args.imgsz,
+            batch_size=batch,
+            augment=mode == "train",
+            hyp=copy(self.args),
+            rect=mode == "val",
+            cache=self.args.cache or None,
+            single_cls=self.args.single_cls or False,
+            stride=stride,
+            pad=0.0 if mode == "train" else 0.5,
+            prefix=colorstr(f"{mode}: "),
+            classes=self.args.classes,
+            data=self.data,
+            fraction=self.args.fraction if mode == "train" else 1.0,
+        )
+
     def get_model(
-        self,
-        cfg: str | dict | None = None,
-        weights: str | Path | None = None,
-        verbose: bool = True,
-    ) -> StructureOBBModel:
+        self, cfg: str | dict | None = None, weights: str | Path | None = None, verbose: bool = True
+    ) -> GeometryOBBModel:
         model = self.set_model_names_for_load(
-            StructureOBBModel(
+            GeometryOBBModel(
                 cfg,
                 nc=self.data["nc"],
                 ch=self.data["channels"],
                 verbose=verbose and RANK == -1,
-                structure_config=self.structure_config,
+                geometry_config=self.geometry_config,
             )
         )
         if weights:
@@ -248,8 +208,5 @@ class StructureOBBTrainer(OBBTrainer):
 
     def get_validator(self):
         return yolo.obb.OBBValidator(
-            self.test_loader,
-            save_dir=self.save_dir,
-            args=copy(self.args),
-            _callbacks=self.callbacks,
+            self.test_loader, save_dir=self.save_dir, args=copy(self.args), _callbacks=self.callbacks
         )

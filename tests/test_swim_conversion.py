@@ -1,7 +1,7 @@
 import math
 from pathlib import Path
 
-from wake_structure.swim import convert_annotation, convert_swim_dataset, rotated_box_corners
+from wake_structure.swim import convert_annotation, convert_landmarks, convert_swim_dataset, rotated_box_corners
 
 
 def _write_xml(path: Path, *, angle: float = 0.0, cx: float = 50, cy: float = 40) -> None:
@@ -12,6 +12,18 @@ def _write_xml(path: Path, *, angle: float = 0.0, cx: float = 50, cy: float = 40
     <name>wake</name><difficult>0</difficult>
     <robndbox><cx>{cx}</cx><cy>{cy}</cy><w>40</w><h>20</h><angle>{angle}</angle></robndbox>
   </object>
+</annotation>""",
+        encoding="utf-8",
+    )
+
+
+def _write_landmark_xml(path: Path) -> None:
+    path.write_text(
+        """<annotation>
+  <size><width>100</width><height>80</height><depth>3</depth></size>
+  <object><difficult>0</difficult><pointtheta>
+    <px>25</px><py>40</py><theta1>-0.5</theta1><theta2>0.5</theta2>
+  </pointtheta></object>
 </annotation>""",
         encoding="utf-8",
     )
@@ -34,6 +46,12 @@ def test_annotation_is_normalized_and_ordered(tmp_path: Path) -> None:
     assert stats.clipped_boxes == 0
     assert len(records[0]) == 8
     assert all(0 <= value <= 1 for value in records[0])
+
+
+def test_landmark_is_normalized_and_keeps_radians(tmp_path: Path) -> None:
+    xml = tmp_path / "landmark.xml"
+    _write_landmark_xml(xml)
+    assert convert_landmarks(xml) == [[0.25, 0.5, -0.5, 0.5]]
 
 
 def test_out_of_bounds_corners_are_preserved_by_default(tmp_path: Path) -> None:
@@ -60,16 +78,18 @@ def test_out_of_bounds_corners_can_be_clipped_explicitly(tmp_path: Path) -> None
 
 def test_complete_split_conversion(tmp_path: Path) -> None:
     source, output = tmp_path / "SWIM", tmp_path / "converted"
-    for directory in ("JPEGImages", "Annotations", "ImageSets"):
+    for directory in ("JPEGImages", "Annotations", "Landmarks", "ImageSets"):
         (source / directory).mkdir(parents=True)
     for index, split in enumerate(("train", "val", "test"), start=1):
         identifier = f"{index:05d}"
         (source / "JPEGImages" / f"{identifier}.jpg").write_bytes(b"image")
         _write_xml(source / "Annotations" / f"{identifier}.xml")
+        _write_landmark_xml(source / "Landmarks" / f"{identifier}.xml")
         (source / "ImageSets" / f"{split}.txt").write_text(identifier + "\n", encoding="utf-8")
 
     results = convert_swim_dataset(source, output, image_mode="copy")
     assert {split: stats.images for split, stats in results.items()} == {"train": 1, "val": 1, "test": 1}
     assert (output / "swim.yaml").is_file()
     assert (output / "labels" / "train" / "00001.txt").read_text().startswith("0 ")
+    assert (output / "landmarks" / "train" / "00001.txt").read_text().startswith("0.25000000 ")
     assert (output / "images" / "test" / "00003.jpg").is_file()

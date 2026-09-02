@@ -21,6 +21,7 @@ SPLITS = ("train", "val", "test")
 class ConversionStats:
     images: int = 0
     boxes: int = 0
+    landmarks: int = 0
     out_of_bounds_boxes: int = 0
     clipped_boxes: int = 0
     skipped_difficult: int = 0
@@ -106,6 +107,36 @@ def convert_annotation(xml_path: str | Path, *, clip_boxes: bool = False) -> tup
     return records, stats
 
 
+def convert_landmarks(xml_path: str | Path) -> list[list[float]]:
+    """Read normalized tip coordinates and Kelvin-arm angles from one SWIM XML file."""
+
+    xml_path = Path(xml_path)
+    root = ET.parse(xml_path).getroot()
+    image_width = float(root.findtext("size/width", "0"))
+    image_height = float(root.findtext("size/height", "0"))
+    if image_width <= 0 or image_height <= 0:
+        raise ValueError(f"Invalid image dimensions in {xml_path}")
+
+    records: list[list[float]] = []
+    for object_node in root.findall("object"):
+        if object_node.findtext("difficult", "0").strip() == "1":
+            continue
+        point = object_node.find("pointtheta")
+        if point is None:
+            raise ValueError(f"Missing <pointtheta> in {xml_path}")
+        values = [
+            float(point.findtext("px", "nan")),
+            float(point.findtext("py", "nan")),
+            float(point.findtext("theta1", "nan")),
+            float(point.findtext("theta2", "nan")),
+        ]
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError(f"Invalid landmark in {xml_path}")
+        px, py, theta1, theta2 = values
+        records.append([px / image_width, py / image_height, theta1, theta2])
+    return records
+
+
 def _find_split_file(source: Path, split: str) -> Path:
     candidates = [path for path in source.rglob(f"{split}.txt") if "imagesets" in path.as_posix().lower()]
     if len(candidates) != 1:
@@ -157,13 +188,15 @@ def convert_swim_dataset(
         raise FileNotFoundError(f"SWIM source does not exist: {source}")
     image_directory = source / "JPEGImages"
     annotation_directory = source / "Annotations"
-    if not image_directory.is_dir() or not annotation_directory.is_dir():
-        raise FileNotFoundError(f"Expected JPEGImages and Annotations under {source}")
+    landmark_directory = source / "Landmarks"
+    if not image_directory.is_dir() or not annotation_directory.is_dir() or not landmark_directory.is_dir():
+        raise FileNotFoundError(f"Expected JPEGImages, Annotations, and Landmarks under {source}")
     if image_mode not in {"auto", "copy", "symlink", "hardlink"}:
         raise ValueError(f"Unsupported image mode: {image_mode}")
 
     images = _index_by_stem(image_directory, IMAGE_EXTENSIONS)
     annotations = _index_by_stem(annotation_directory, {".xml"})
+    landmarks = _index_by_stem(landmark_directory, {".xml"})
     output.mkdir(parents=True, exist_ok=True)
     results: dict[str, ConversionStats] = {}
 
@@ -179,17 +212,33 @@ def convert_swim_dataset(
                 raise FileNotFoundError(f"Missing image for {split} identifier {identifier}")
             if identifier not in annotations:
                 raise FileNotFoundError(f"Missing annotation for {split} identifier {identifier}")
+            if identifier not in landmarks:
+                raise FileNotFoundError(f"Missing landmark for {split} identifier {identifier}")
 
             source_image = images[identifier]
             target_image = output / "images" / split / f"{identifier}{source_image.suffix.lower()}"
             _materialize_image(source_image, target_image, image_mode)
 
             records, annotation_stats = convert_annotation(annotations[identifier], clip_boxes=clip_boxes)
+            landmark_records = convert_landmarks(landmarks[identifier])
+            if len(records) != len(landmark_records):
+                raise ValueError(
+                    f"OBB/landmark count mismatch for {identifier}: {len(records)} boxes, "
+                    f"{len(landmark_records)} landmarks"
+                )
             target_label = output / "labels" / split / f"{identifier}.txt"
             target_label.parent.mkdir(parents=True, exist_ok=True)
             lines = ["0 " + " ".join(f"{coordinate:.8f}" for coordinate in record) for record in records]
             target_label.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+
+            target_landmark = output / "landmarks" / split / f"{identifier}.txt"
+            target_landmark.parent.mkdir(parents=True, exist_ok=True)
+            landmark_lines = [" ".join(f"{value:.8f}" for value in record) for record in landmark_records]
+            target_landmark.write_text(
+                "\n".join(landmark_lines) + ("\n" if landmark_lines else ""), encoding="utf-8"
+            )
             split_stats.images += 1
+            split_stats.landmarks += len(landmark_records)
             split_stats.add(annotation_stats)
         results[split] = split_stats
 
@@ -199,6 +248,8 @@ def convert_swim_dataset(
         "val": "images/val",
         "test": "images/test",
         "names": {0: "wake"},
+        "kpt_shape": [3, 3],
+        "flip_idx": [0, 1, 2],
     }
     (output / "swim.yaml").write_text(
         yaml.safe_dump(dataset_yaml, sort_keys=False, allow_unicode=True), encoding="utf-8"
@@ -208,7 +259,9 @@ def convert_swim_dataset(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--source", required=True, help="Path containing JPEGImages, Annotations, and ImageSets")
+    parser.add_argument(
+        "--source", required=True, help="Path containing JPEGImages, Annotations, Landmarks, and ImageSets"
+    )
     parser.add_argument("--output", default="/kaggle/working/swim_yolo_obb")
     parser.add_argument(
         "--image-mode",

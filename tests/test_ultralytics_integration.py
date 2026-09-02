@@ -3,19 +3,19 @@ import torch
 
 pytest.importorskip("ultralytics")
 
-from wake_structure.config import StructureConfig, StructureLossConfig
-from wake_structure.model import StructureOBBModel
 from ultralytics.cfg import get_cfg
 
+from wake_structure.config import GeometryConfig
+from wake_structure.model import GeometryOBBModel
 
-def test_yolov8_obb_structure_model_minimal_forward_and_loss() -> None:
-    config = StructureConfig(
-        enable_equivariance=False,
-        enable_feature_guidance=True,
-        loss=StructureLossConfig(equivariance_weight=0.0),
+
+def test_yolov8_obb_geometry_model_minimal_forward_and_loss() -> None:
+    model = GeometryOBBModel(
+        "yolov8n-obb.yaml",
+        nc=1,
+        verbose=False,
+        geometry_config=GeometryConfig(enable_refinement=True),
     )
-    model = StructureOBBModel("yolov8n-obb.yaml", nc=1, verbose=False, structure_config=config)
-    # The real trainer assigns its resolved runtime arguments before the first loss call.
     model.args = get_cfg()
     model.train()
     batch = {
@@ -23,17 +23,17 @@ def test_yolov8_obb_structure_model_minimal_forward_and_loss() -> None:
         "batch_idx": torch.tensor([0.0]),
         "cls": torch.tensor([[0.0]]),
         "bboxes": torch.tensor([[0.5, 0.5, 0.5, 0.12, 0.2]]),
+        "keypoints": torch.tensor([[[0.35, 0.5, 1.0], [0.45, 0.45, 1.0], [0.45, 0.55, 1.0]]]),
     }
     loss_vector, items = model(batch)
     assert loss_vector.ndim == 1
-    assert "structure_presence_loss" in items
+    assert "geometry_tip_loss" in items
     assert torch.isfinite(loss_vector).all()
     loss_vector.sum().backward()
-    assert model.structure_head.output.weight.grad is not None
-    assert model.feature_guidance is not None
-    assert model.feature_guidance.alpha.grad is not None
-    assert torch.isfinite(model.feature_guidance.alpha.grad)
+    assert model.geometry_head.output.weight.grad is not None
+    assert model.geometry_refinement is not None
+    assert model.geometry_refinement.feature_scale.grad is not None
 
-    maps = model.structure_maps(batch["img"])
-    assert maps["presence"].shape[1] == 1
-    assert maps["orientation_distribution"].shape[1] == 8
+    maps = model.geometry_maps(batch["img"])
+    assert maps["structure"].shape[1] == 1
+    assert maps["arm1_distribution"].shape[1] == 16

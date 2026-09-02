@@ -1,6 +1,6 @@
 import os
 
-from kaggle_run_v2 import _version_tuple, newest_run_weights, unique_output
+from kaggle_run_geometry import _version_tuple, newest_run_weights, unique_output
 
 
 def test_version_tuple_accepts_package_suffix() -> None:

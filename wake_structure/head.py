@@ -1,8 +1,9 @@
-"""The deliberately small first version of the wake Structure Head."""
+"""Wake geometry prediction head."""
 
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 
 import torch
 from torch import nn
@@ -17,53 +18,45 @@ class ConvNormAct(nn.Sequential):
         )
 
 
-class StructureHead(nn.Module):
-    """Predict one wake-presence logit and ``K`` axial-orientation logits.
+@dataclass
+class GeometryLogits:
+    structure: torch.Tensor
+    tip: torch.Tensor
+    offset: torch.Tensor
+    arm1: torch.Tensor
+    arm2: torch.Tensor
 
-    The network does not directly predict an angle or confidence. Those are
-    deterministic quantities decoded from the orientation distribution.
-    """
 
-    def __init__(
-        self,
-        in_channels: int,
-        hidden_channels: int = 64,
-        num_bins: int = 8,
-        dropout: float = 0.0,
-    ) -> None:
+class GeometryHead(nn.Module):
+    """Predict wake structure, tip, sub-cell offset, and two Kelvin-arm directions."""
+
+    def __init__(self, in_channels: int, hidden_channels: int = 64, num_bins: int = 16, dropout: float = 0.0) -> None:
         super().__init__()
-        if num_bins < 2:
-            raise ValueError("num_bins must be >= 2.")
         self.num_bins = num_bins
-        blocks: list[nn.Module] = [
+        layers: list[nn.Module] = [
             ConvNormAct(in_channels, hidden_channels),
             ConvNormAct(hidden_channels, hidden_channels),
         ]
         if dropout:
-            blocks.append(nn.Dropout2d(dropout))
-        self.features = nn.Sequential(*blocks)
-        self.output = nn.Conv2d(hidden_channels, 1 + num_bins, 1)
-        self.reset_parameters()
-
-    def reset_parameters(self) -> None:
+            layers.append(nn.Dropout2d(dropout))
+        self.features = nn.Sequential(*layers)
+        self.output = nn.Conv2d(hidden_channels, 4 + 2 * num_bins, 1)
         nn.init.normal_(self.output.weight, mean=0.0, std=0.01)
         nn.init.zeros_(self.output.bias)
-        # A sparse initial map is safer than starting with P=0.5 everywhere.
-        self.output.bias.data[0] = math.log(0.01 / 0.99)
+        self.output.bias.data[:2] = math.log(0.01 / 0.99)
 
     def forward(self, feature: torch.Tensor) -> torch.Tensor:
         return self.output(self.features(feature))
 
 
-def split_structure_logits(logits: torch.Tensor, num_bins: int | None = None) -> tuple[torch.Tensor, torch.Tensor]:
-    """Split a ``[B, 1+K, H, W]`` tensor into presence and direction logits."""
-
-    if logits.ndim != 4:
-        raise ValueError(f"Expected BCHW logits, got shape {tuple(logits.shape)}")
-    inferred_bins = logits.shape[1] - 1
-    if inferred_bins < 2:
-        raise ValueError("Structure logits need at least one presence and two direction channels.")
-    if num_bins is not None and inferred_bins != num_bins:
-        raise ValueError(f"Expected {num_bins} direction bins, got {inferred_bins}.")
-    return logits[:, :1], logits[:, 1:]
+def split_geometry_logits(logits: torch.Tensor, num_bins: int) -> GeometryLogits:
+    if logits.ndim != 4 or logits.shape[1] != 4 + 2 * num_bins:
+        raise ValueError(f"Expected [B,{4 + 2 * num_bins},H,W] geometry logits, got {tuple(logits.shape)}")
+    return GeometryLogits(
+        structure=logits[:, 0:1],
+        tip=logits[:, 1:2],
+        offset=logits[:, 2:4],
+        arm1=logits[:, 4 : 4 + num_bins],
+        arm2=logits[:, 4 + num_bins :],
+    )
 

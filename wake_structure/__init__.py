@@ -1,15 +1,16 @@
-"""Weakly supervised wake-structure learning components."""
+"""Landmark-supervised wake geometry components."""
 
-from .config import StructureConfig, StructureLossConfig
-from .geometry import decode_orientation
-from .guidance import StructureGuidedExtractor
-from .head import StructureHead, split_structure_logits
+from .config import GeometryConfig, GeometryLossConfig
+from .geometry import decode_direction, decode_geometry
+from .guidance import GeometryGuidedRefinement
+from .head import GeometryHead, split_geometry_logits
 
 __all__ = [
-    "StructureConfig",
-    "StructureHead",
-    "StructureGuidedExtractor",
-    "StructureLossConfig",
-    "decode_orientation",
-    "split_structure_logits",
+    "GeometryConfig",
+    "GeometryHead",
+    "GeometryGuidedRefinement",
+    "GeometryLossConfig",
+    "decode_direction",
+    "decode_geometry",
+    "split_geometry_logits",
 ]

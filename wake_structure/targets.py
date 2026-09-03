@@ -13,8 +13,11 @@ from .geometry import direction_bin_centers
 @dataclass
 class GeometryTargets:
     roi_mask: torch.Tensor
-    instance_masks: torch.Tensor
-    instance_batch_indices: torch.Tensor
+    structure_search_mask: torch.Tensor
+    structure_background_mask: torch.Tensor
+    segment_masks: torch.Tensor
+    segment_batch_indices: torch.Tensor
+    segment_group_indices: torch.Tensor
     tip_heatmap: torch.Tensor
     tip_indices: torch.Tensor
     tip_batch_indices: torch.Tensor
@@ -56,6 +59,9 @@ def build_geometry_targets(
     direction_kappa: float,
     roi_margin: float,
     tip_radius: int,
+    structure_band_width: float = 2.0,
+    structure_ignore_width: float = 4.0,
+    structure_segments: int = 4,
 ) -> GeometryTargets:
     images = batch["img"]
     boxes = batch["bboxes"].reshape(-1, 5).to(device=images.device, dtype=images.dtype)
@@ -71,15 +77,22 @@ def build_geometry_targets(
     centers = direction_bin_centers(num_bins, device=device, dtype=dtype)
 
     roi = torch.zeros(batch_size, 1, height, width, device=device, dtype=dtype)
+    structure_search = torch.zeros_like(roi)
+    structure_ignore = torch.zeros_like(roi)
     tip_heatmap = torch.zeros_like(roi)
     arm1_sum = torch.zeros(batch_size, num_bins, height, width, device=device, dtype=dtype)
     arm2_sum = torch.zeros_like(arm1_sum)
     direction_count = torch.zeros_like(roi)
-    masks: list[torch.Tensor] = []
-    mask_batch_indices: list[torch.Tensor] = []
+    segment_masks: list[torch.Tensor] = []
+    segment_batch_indices: list[torch.Tensor] = []
+    segment_group_indices: list[int] = []
     tip_indices: list[torch.Tensor] = []
     tip_batch_indices: list[torch.Tensor] = []
     tip_offsets: list[torch.Tensor] = []
+
+    next_group = 0
+    feature_grid_x = grid_x * width
+    feature_grid_y = grid_y * height
 
     for box, points, image_index in zip(boxes, keypoints, batch_indices):
         index = int(image_index.item())
@@ -94,8 +107,6 @@ def build_geometry_targets(
         if not mask.any():
             continue
         roi[index, 0].masked_fill_(mask, 1.0)
-        masks.append(mask)
-        mask_batch_indices.append(image_index)
 
         tip = points[0]
         if tip.shape[0] > 2 and tip[2] <= 0:
@@ -110,18 +121,53 @@ def build_geometry_targets(
 
         vector1 = torch.stack(((points[1, 0] - tip[0]) * width, (points[1, 1] - tip[1]) * height))
         vector2 = torch.stack(((points[2, 0] - tip[0]) * width, (points[2, 1] - tip[1]) * height))
+        if vector1.norm() <= 1e-6 or vector2.norm() <= 1e-6:
+            continue
+        arm_search_masks: list[torch.Tensor] = []
+        for vector in (vector1, vector2):
+            norm = vector.norm()
+            unit = vector / norm
+            rel_x = feature_grid_x - feature_tip[0]
+            rel_y = feature_grid_y - feature_tip[1]
+            arm_along = rel_x * unit[0] + rel_y * unit[1]
+            arm_across = (-rel_x * unit[1] + rel_y * unit[0]).abs()
+            forward = mask & (arm_along >= 0)
+            if not forward.any():
+                continue
+            max_length = arm_along[forward].max().clamp_min(1e-6)
+            search_mask = forward & (arm_across <= structure_band_width)
+            ignore_mask = forward & (arm_across <= structure_ignore_width)
+            structure_search[index, 0].masked_fill_(search_mask, 1.0)
+            structure_ignore[index, 0].masked_fill_(ignore_mask, 1.0)
+            arm_search_masks.append(search_mask)
+
+            for segment_index in range(structure_segments):
+                lower = max_length * segment_index / structure_segments
+                upper = max_length * (segment_index + 1) / structure_segments
+                segment = search_mask & (arm_along >= lower) & (arm_along <= upper)
+                if segment.any():
+                    segment_masks.append(segment)
+                    segment_batch_indices.append(image_index)
+                    segment_group_indices.append(next_group)
+            next_group += 1
+
         theta1 = torch.remainder(torch.atan2(vector1[1], vector1[0]), 2 * math.pi)
         theta2 = torch.remainder(torch.atan2(vector2[1], vector2[0]), 2 * math.pi)
-        arm1_sum[index, :, mask] += _soft_direction(theta1, centers, direction_kappa)[:, None]
-        arm2_sum[index, :, mask] += _soft_direction(theta2, centers, direction_kappa)[:, None]
-        direction_count[index, 0, mask] += 1
+        if not arm_search_masks:
+            continue
+        direction_region = torch.stack(arm_search_masks).any(dim=0)
+        arm1_sum[index, :, direction_region] += _soft_direction(theta1, centers, direction_kappa)[:, None]
+        arm2_sum[index, :, direction_region] += _soft_direction(theta2, centers, direction_kappa)[:, None]
+        direction_count[index, 0, direction_region] += 1
 
-    if masks:
-        instance_masks = torch.stack(masks)
-        instance_batch_indices = torch.stack(mask_batch_indices).long()
+    if segment_masks:
+        segment_mask_tensor = torch.stack(segment_masks)
+        segment_batch_tensor = torch.stack(segment_batch_indices).long()
+        segment_group_tensor = torch.tensor(segment_group_indices, device=device, dtype=torch.long)
     else:
-        instance_masks = torch.zeros(0, height, width, device=device, dtype=torch.bool)
-        instance_batch_indices = torch.zeros(0, device=device, dtype=torch.long)
+        segment_mask_tensor = torch.zeros(0, height, width, device=device, dtype=torch.bool)
+        segment_batch_tensor = torch.zeros(0, device=device, dtype=torch.long)
+        segment_group_tensor = torch.zeros(0, device=device, dtype=torch.long)
     if tip_indices:
         tip_index_tensor = torch.stack(tip_indices)
         tip_batch_tensor = torch.stack(tip_batch_indices).long()
@@ -133,8 +179,11 @@ def build_geometry_targets(
 
     return GeometryTargets(
         roi_mask=roi,
-        instance_masks=instance_masks,
-        instance_batch_indices=instance_batch_indices,
+        structure_search_mask=structure_search,
+        structure_background_mask=1.0 - structure_ignore,
+        segment_masks=segment_mask_tensor,
+        segment_batch_indices=segment_batch_tensor,
+        segment_group_indices=segment_group_tensor,
         tip_heatmap=tip_heatmap,
         tip_indices=tip_index_tensor,
         tip_batch_indices=tip_batch_tensor,
@@ -143,4 +192,3 @@ def build_geometry_targets(
         arm2_distribution=arm2_sum / direction_count.clamp_min(1),
         direction_mask=(direction_count > 0).to(dtype),
     )
-

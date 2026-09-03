@@ -124,6 +124,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workers", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--mode", choices=("baseline", "geometry", "both"), default="both")
+    parser.add_argument("--refinement-mode", choices=("aux", "denoise", "extract", "full"), default="full")
+    parser.add_argument("--geometry-config", default="configs/geometry.yaml")
     parser.add_argument("--name-prefix", default="pilot20_s42")
     return parser.parse_args()
 
@@ -168,7 +170,15 @@ def train_variant(
         str(archive),
     ]
     if variant == "geometry":
-        command[4:4] = ["--geometry-config", str(project_root / "configs" / "geometry.yaml")]
+        config_path = Path(args.geometry_config)
+        if not config_path.is_absolute():
+            config_path = project_root / config_path
+        command[4:4] = [
+            "--geometry-config",
+            str(config_path),
+            "--refinement-mode",
+            args.refinement_mode,
+        ]
     started_at = time.time()
     run(command, cwd=project_root)
     return newest_run_weights(run_root, started_at), archive

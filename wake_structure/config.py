@@ -21,21 +21,27 @@ def _known_kwargs(cls: type, values: dict[str, Any]) -> dict[str, Any]:
 class GeometryLossConfig:
     mil_weight: float = 1.0
     background_weight: float = 0.25
-    sparse_weight: float = 0.05
+    continuity_weight: float = 0.10
     tip_weight: float = 1.0
     offset_weight: float = 0.25
     arm_weight: float = 0.5
     mil_topk_fraction: float = 0.10
-    max_foreground_fraction: float = 0.25
     direction_kappa: float = 8.0
     roi_margin: float = 0.05
+    structure_band_width: float = 2.0
+    structure_ignore_width: float = 4.0
+    structure_segments: int = 4
     tip_radius: int = 2
 
     def __post_init__(self) -> None:
         if not 0 < self.mil_topk_fraction <= 1:
             raise ValueError("mil_topk_fraction must be in (0, 1].")
-        if not 0 < self.max_foreground_fraction <= 1:
-            raise ValueError("max_foreground_fraction must be in (0, 1].")
+        if self.structure_band_width <= 0:
+            raise ValueError("structure_band_width must be positive.")
+        if self.structure_ignore_width < self.structure_band_width:
+            raise ValueError("structure_ignore_width must be at least structure_band_width.")
+        if self.structure_segments < 1:
+            raise ValueError("structure_segments must be positive.")
         if self.tip_radius < 0:
             raise ValueError("tip_radius must be non-negative.")
 
@@ -47,8 +53,11 @@ class GeometryConfig:
     hidden_channels: int = 64
     dropout: float = 0.0
     enable_refinement: bool = True
+    enable_denoising: bool = True
+    enable_directional_extraction: bool = True
     refinement_hidden_channels: int = 64
-    sampling_step: float = 1.0
+    sampling_steps: tuple[float, ...] = (1.0, 2.0, 4.0)
+    confidence_floor: float = 0.2
     denoise_scale_init: float = 0.0
     feature_scale_init: float = 0.0
     loss: GeometryLossConfig = field(default_factory=GeometryLossConfig)
@@ -60,13 +69,17 @@ class GeometryConfig:
             raise ValueError("p3_layer_index must be non-negative.")
         if self.hidden_channels < 1 or self.refinement_hidden_channels < 1:
             raise ValueError("hidden channel counts must be positive.")
-        if self.sampling_step <= 0:
-            raise ValueError("sampling_step must be positive.")
+        if not self.sampling_steps or any(step <= 0 for step in self.sampling_steps):
+            raise ValueError("sampling_steps must contain positive values.")
+        if not 0 <= self.confidence_floor <= 1:
+            raise ValueError("confidence_floor must be in [0, 1].")
 
     @classmethod
     def from_dict(cls, values: dict[str, Any] | None) -> "GeometryConfig":
         values = dict(values or {})
         loss_values = values.pop("loss", {})
+        if "sampling_steps" in values:
+            values["sampling_steps"] = tuple(float(step) for step in values["sampling_steps"])
         loss = GeometryLossConfig(**_known_kwargs(GeometryLossConfig, dict(loss_values)))
         return cls(loss=loss, **_known_kwargs(cls, values))
 

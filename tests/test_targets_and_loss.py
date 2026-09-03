@@ -21,6 +21,10 @@ def test_targets_include_tip_offset_and_two_arms() -> None:
     assert targets.tip_offsets.shape == (1, 2)
     assert targets.arm1_distribution.shape == (1, 16, 8, 8)
     assert targets.direction_mask.sum() > 0
+    assert targets.segment_masks.shape[0] >= 4
+    assert targets.structure_search_mask.sum() > 0
+    assert targets.structure_search_mask.sum() < targets.roi_mask.sum()
+    assert torch.all(targets.structure_background_mask[targets.structure_search_mask.bool()] == 0)
 
 
 def test_geometry_loss_is_finite_and_backpropagates() -> None:
@@ -30,4 +34,3 @@ def test_geometry_loss_is_finite_and_backpropagates() -> None:
     assert torch.isfinite(total)
     total.backward()
     assert logits.grad is not None and torch.isfinite(logits.grad).all()
-

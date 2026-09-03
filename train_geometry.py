@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 
 from wake_structure.artifacts import create_archive
 from wake_structure.config import GeometryConfig
@@ -13,6 +14,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", required=True)
     parser.add_argument("--geometry-config", default="configs/geometry.yaml")
+    parser.add_argument(
+        "--refinement-mode",
+        choices=("aux", "denoise", "extract", "full"),
+        default="full",
+        help="Geometry supervision alone, one refinement path, or both paths.",
+    )
     parser.add_argument("--model", default="yolov8n-obb.pt")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--imgsz", type=int, default=640)
@@ -31,6 +38,12 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     config = GeometryConfig.from_yaml(args.geometry_config)
+    config = replace(
+        config,
+        enable_refinement=args.refinement_mode != "aux",
+        enable_denoising=args.refinement_mode in {"denoise", "full"},
+        enable_directional_extraction=args.refinement_mode in {"extract", "full"},
+    )
     overrides = {
         "model": args.model,
         "data": args.data,

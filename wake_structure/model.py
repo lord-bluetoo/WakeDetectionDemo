@@ -58,7 +58,10 @@ class GeometryOBBModel(OBBModel):
                 in_channels,
                 hidden_channels=self.geometry_config.refinement_hidden_channels,
                 num_bins=self.geometry_config.num_bins,
-                sampling_step=self.geometry_config.sampling_step,
+                sampling_steps=self.geometry_config.sampling_steps,
+                confidence_floor=self.geometry_config.confidence_floor,
+                enable_denoising=self.geometry_config.enable_denoising,
+                enable_directional_extraction=self.geometry_config.enable_directional_extraction,
                 denoise_scale_init=self.geometry_config.denoise_scale_init,
                 feature_scale_init=self.geometry_config.feature_scale_init,
             )
@@ -156,8 +159,29 @@ class GeometryOBBModel(OBBModel):
         return total_vector, logged_items
 
     def geometry_maps(self, images: torch.Tensor) -> dict[str, torch.Tensor]:
-        logits = self.geometry_head(self._extract_p3(images))
-        return decode_geometry(logits, self.geometry_config.num_bins)
+        feature = self._extract_p3(images)
+        logits = self.geometry_head(feature)
+        maps = decode_geometry(logits, self.geometry_config.num_bins)
+        if self.geometry_refinement is not None:
+            maps.update(self.geometry_refinement.decode_gates(logits))
+            maps["geometry_gate"] = maps["enhancement_gate"]
+        return maps
+
+    @torch.no_grad()
+    def geometry_diagnostics(self, images: torch.Tensor) -> dict[str, torch.Tensor]:
+        feature = self._extract_p3(images)
+        logits = self.geometry_head(feature)
+        maps = decode_geometry(logits, self.geometry_config.num_bins)
+        if self.geometry_refinement is not None:
+            maps.update(self.geometry_refinement.diagnostic_maps(feature, logits))
+            maps["denoise_scale"] = torch.tanh(self.geometry_refinement.denoise_scale)
+            maps["feature_scale"] = torch.tanh(self.geometry_refinement.feature_scale)
+        else:
+            maps["direction_confidence"] = torch.sqrt(maps["confidence1"] * maps["confidence2"])
+            maps["denoise_gate"] = 1 - maps["structure"]
+            maps["enhancement_gate"] = maps["geometry_gate"]
+            maps["feature_change"] = torch.zeros_like(maps["structure"])
+        return maps
 
 
 class GeometryOBBTrainer(OBBTrainer):

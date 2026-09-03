@@ -42,34 +42,36 @@ class GeometryCriterion(nn.Module):
             direction_kappa=self.config.direction_kappa,
             roi_margin=self.config.roi_margin,
             tip_radius=self.config.tip_radius,
+            structure_band_width=self.config.structure_band_width,
+            structure_ignore_width=self.config.structure_ignore_width,
+            structure_segments=self.config.structure_segments,
         )
 
         presence = parts.structure.sigmoid()
-        mil = _zero(logits)
-        for mask, image_index in zip(targets.instance_masks, targets.instance_batch_indices):
+        segment_scores: list[torch.Tensor] = []
+        for mask, image_index in zip(targets.segment_masks, targets.segment_batch_indices):
             values = presence[int(image_index.item()), 0][mask]
             count = max(1, math.ceil(values.numel() * self.config.mil_topk_fraction))
-            mil = mil - torch.log(values.topk(count).values.mean().clamp_min(1e-6))
-        if len(targets.instance_masks):
-            mil = mil / len(targets.instance_masks)
+            segment_scores.append(values.topk(count).values.mean())
+        if segment_scores:
+            scores = torch.stack(segment_scores)
+            mil = -torch.log(scores.clamp_min(1e-6)).mean()
+            continuity_terms = []
+            for group_index in targets.segment_group_indices.unique():
+                group_scores = scores[targets.segment_group_indices == group_index]
+                if len(group_scores) > 1:
+                    continuity_terms.append((group_scores[1:] - group_scores[:-1]).square().mean())
+            continuity = torch.stack(continuity_terms).mean() if continuity_terms else _zero(logits)
+        else:
+            mil = _zero(logits)
+            continuity = _zero(logits)
 
-        outside = 1.0 - targets.roi_mask
-        background = (F.softplus(parts.structure) * outside).sum() / outside.sum().clamp_min(1)
-        sparse = _zero(logits)
-        valid_images = 0
-        for image_index in range(logits.shape[0]):
-            inside = targets.roi_mask[image_index].bool()
-            if inside.any():
-                sparse = sparse + F.relu(
-                    presence[image_index][inside].mean() - self.config.max_foreground_fraction
-                ).square()
-                valid_images += 1
-        if valid_images:
-            sparse = sparse / valid_images
+        background_mask = targets.structure_background_mask
+        background = (F.softplus(parts.structure) * background_mask).sum() / background_mask.sum().clamp_min(1)
         structure_loss = (
             self.config.mil_weight * mil
             + self.config.background_weight * background
-            + self.config.sparse_weight * sparse
+            + self.config.continuity_weight * continuity
         )
 
         tip_loss = self.config.tip_weight * _heatmap_focal_loss(parts.tip, targets.tip_heatmap)
@@ -94,4 +96,3 @@ class GeometryCriterion(nn.Module):
             "geometry_offset_loss": offset_loss,
             "geometry_arm_loss": arm_loss,
         }
-
